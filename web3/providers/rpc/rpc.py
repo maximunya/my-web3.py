@@ -1,5 +1,6 @@
 import logging
 import time
+
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -10,6 +11,7 @@ from typing import (
     Tuple,
     Union,
     cast,
+    Generator
 )
 
 from eth_typing import (
@@ -49,6 +51,7 @@ from .utils import (
     ExceptionRetryConfiguration,
     check_if_retry_on_failure,
 )
+from ...exceptions import Web3ValidationError
 
 if TYPE_CHECKING:
     from web3.middleware.base import (  # noqa: F401
@@ -58,12 +61,12 @@ if TYPE_CHECKING:
 
 class HTTPProvider(JSONBaseProvider):
     logger = logging.getLogger("web3.providers.HTTPProvider")
-    endpoint_uri = None
+    endpoint_uris = None
     _request_kwargs = None
 
     def __init__(
         self,
-        endpoint_uri: Optional[Union[URI, str]] = None,
+        endpoint_uris: Optional[Union[URI, str, List[str], Tuple[str], Generator[str, None, None]]] = None,
         request_kwargs: Optional[Any] = None,
         session: Optional[Any] = None,
         exception_retry_configuration: Optional[
@@ -72,26 +75,53 @@ class HTTPProvider(JSONBaseProvider):
         **kwargs: Any,
     ) -> None:
         self._request_session_manager = HTTPSessionManager()
+        self._unavailable_nodes = {}
 
-        if endpoint_uri is None:
-            self.endpoint_uri = (
-                self._request_session_manager.get_default_http_endpoint()
-            )
+        if endpoint_uris is None:
+            self.endpoint_uris = [self._request_session_manager.get_default_http_endpoint()]
+        elif isinstance(endpoint_uris, str):
+            self.endpoint_uris = [URI(endpoint_uris), ]
+        elif isinstance(endpoint_uris, URI):
+            self.endpoint_uris = [endpoint_uris,]
+        elif isinstance(endpoint_uris, (list, tuple, Generator)):
+            self.endpoint_uris = [URI(uri) for uri in endpoint_uris]
         else:
-            self.endpoint_uri = URI(endpoint_uri)
+            raise Web3ValidationError("Invalid type for endpoint_uris")
 
         self._request_kwargs = request_kwargs or {}
         self._exception_retry_configuration = exception_retry_configuration
 
         if session:
-            self._request_session_manager.cache_and_return_session(
-                self.endpoint_uri, session
-            )
+            for uri in self.endpoint_uris:
+                self._request_session_manager.cache_and_return_session(uri, session)
 
         super().__init__(**kwargs)
 
     def __str__(self) -> str:
-        return f"RPC connection {self.endpoint_uri}"
+        return f"RPC connection {self.endpoint_uris}"
+
+    def _get_refreshed_nodes(self) -> List[URI]:
+        self._clean_unavailable_nodes()
+        if not self.endpoint_uris:
+            raise Exception("All nodes are currently unavailable.")
+        return self.endpoint_uris
+
+    def _mark_node_as_unavailable(self, node: URI) -> None:
+        if node in self.endpoint_uris:
+            self.endpoint_uris.remove(node)
+        retry_after = 60  # Set retry time to 60 seconds
+        self._unavailable_nodes[node] = time.time() + retry_after
+
+    def _clean_unavailable_nodes(self) -> None:
+        current_time = time.time()
+        nodes_to_remove = []
+        for node, retry_time in self._unavailable_nodes.items():
+            if current_time > retry_time:
+                nodes_to_remove.append(node)
+
+        for node in nodes_to_remove:
+            self._unavailable_nodes.pop(node)
+            self.endpoint_uris.append(node)
 
     @property
     def exception_retry_configuration(self) -> ExceptionRetryConfiguration:
@@ -136,30 +166,33 @@ class HTTPProvider(JSONBaseProvider):
         If exception_retry_configuration is set, retry on failure; otherwise, make
         the request without retrying.
         """
-        if (
-            self.exception_retry_configuration is not None
-            and check_if_retry_on_failure(
-                method, self.exception_retry_configuration.method_allowlist
-            )
-        ):
-            for i in range(self.exception_retry_configuration.retries):
-                try:
-                    return self._request_session_manager.make_post_request(
-                        self.endpoint_uri, request_data, **self.get_request_kwargs()
-                    )
-                except tuple(self.exception_retry_configuration.errors) as e:
-                    if i < self.exception_retry_configuration.retries - 1:
-                        time.sleep(
-                            self.exception_retry_configuration.backoff_factor * 2**i
+        nodes = self._get_refreshed_nodes()
+        for node in nodes:
+            if (
+                self.exception_retry_configuration is not None
+                and check_if_retry_on_failure(
+                    method, self.exception_retry_configuration.method_allowlist
+                )
+            ):
+                for i in range(self.exception_retry_configuration.retries):
+                    try:
+                        return self._request_session_manager.make_post_request(
+                            node, request_data, **self.get_request_kwargs()
                         )
-                        continue
-                    else:
-                        raise e
-            return None
-        else:
-            return self._request_session_manager.make_post_request(
-                self.endpoint_uri, request_data, **self.get_request_kwargs()
-            )
+                    except tuple(self.exception_retry_configuration.errors) as e:
+                        if i < self.exception_retry_configuration.retries - 1:
+                            time.sleep(
+                                self.exception_retry_configuration.backoff_factor * 2**i
+                            )
+                            continue
+                        else:
+                            self._mark_node_as_unavailable(node)
+                            raise e
+                return None
+            else:
+                return self._request_session_manager.make_post_request(
+                    node, request_data, **self.get_request_kwargs()
+                )
 
     @handle_request_caching
     def make_request(self, method: RPCEndpoint, params: Any) -> RPCResponse:
