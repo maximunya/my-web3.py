@@ -53,8 +53,6 @@ class WebSocketProvider(PersistentConnectionProvider):
             self.endpoint_uris = [get_default_endpoint()]
         elif isinstance(endpoint_uris, str):
             self.endpoint_uris = [URI(endpoint_uris), ]
-        elif isinstance(endpoint_uris, URI):
-            self.endpoint_uris = [endpoint_uris, ]
         elif isinstance(endpoint_uris, (list, tuple, Generator)):
             self.endpoint_uris = [URI(uri) for uri in endpoint_uris]
         else:
@@ -82,25 +80,24 @@ class WebSocketProvider(PersistentConnectionProvider):
     def __str__(self) -> str:
         return f"WebSocket connection: {self.endpoint_uris}"
 
-    def _get_refreshed_nodes(self) -> List[URI]:
+    def _get_refreshed_nodes(self):
+        """Refresh the list of nodes, cleaning out unavailable ones."""
         self._clean_unavailable_nodes()
         if not self.endpoint_uris:
             raise Exception("All nodes are currently unavailable.")
         return self.endpoint_uris
 
     def _mark_node_as_unavailable(self, node: URI) -> None:
+        """Mark a node as unavailable and retry later."""
         if node in self.endpoint_uris:
             self.endpoint_uris.remove(node)
         retry_after = 60  # Set retry time to 60 seconds
         self._unavailable_nodes[node] = time.time() + retry_after
 
     def _clean_unavailable_nodes(self) -> None:
+        """Clean up nodes that are past their retry period."""
         current_time = time.time()
-        nodes_to_remove = []
-        for node, retry_time in self._unavailable_nodes.items():
-            if current_time > retry_time:
-                nodes_to_remove.append(node)
-
+        nodes_to_remove = [node for node, retry_time in self._unavailable_nodes.items() if current_time > retry_time]
         for node in nodes_to_remove:
             self._unavailable_nodes.pop(node)
             self.endpoint_uris.append(node)
