@@ -13,6 +13,7 @@ from typing import (
     cast,
     Generator
 )
+from venv import logger
 
 from eth_typing import (
     URI,
@@ -51,7 +52,7 @@ from .utils import (
     ExceptionRetryConfiguration,
     check_if_retry_on_failure,
 )
-from ...exceptions import Web3ValidationError
+from ...exceptions import Web3ValidationError, CannotHandleRequest
 
 if TYPE_CHECKING:
     from web3.middleware.base import (  # noqa: F401
@@ -75,7 +76,7 @@ class HTTPProvider(JSONBaseProvider):
         **kwargs: Any,
     ) -> None:
         self._request_session_manager = HTTPSessionManager()
-        self._unavailable_nodes = {}
+        self._unavailable_providers = {}
 
         if endpoint_uris is None:
             self.endpoint_uris = [self._request_session_manager.get_default_http_endpoint()]
@@ -98,27 +99,25 @@ class HTTPProvider(JSONBaseProvider):
     def __str__(self) -> str:
         return f"RPC connection {self.endpoint_uris}"
 
-    def _get_refreshed_nodes(self):
-        """Refresh the list of nodes, cleaning out unavailable ones."""
-        self._clean_unavailable_nodes()
-        if not self.endpoint_uris:
-            raise Exception("All nodes are currently unavailable.")
-        return self.endpoint_uris
+    def _get_prioritized_providers(self):
+        """Return the list of prioritized available providers, cleaning out expired unavailable ones."""
+        self._clean_unavailable_providers()
 
-    def _mark_node_as_unavailable(self, node: URI) -> None:
-        """Mark a node as unavailable and retry later."""
-        if node in self.endpoint_uris:
-            self.endpoint_uris.remove(node)
-        retry_after = 60  # Set retry time to 60 seconds
-        self._unavailable_nodes[node] = time.time() + retry_after
+        available_providers = [provider for provider in self.endpoint_uris if provider not in self._unavailable_providers]
+        unavailable_providers = [provider for provider in self.endpoint_uris if provider in self._unavailable_providers]
+        return available_providers + unavailable_providers
 
-    def _clean_unavailable_nodes(self) -> None:
-        """Clean up nodes that are past their retry period."""
+    def _clean_unavailable_providers(self) -> None:
+        """Clean up providers that are past their retry period."""
         current_time = time.time()
-        nodes_to_remove = [node for node, retry_time in self._unavailable_nodes.items() if current_time > retry_time]
-        for node in nodes_to_remove:
-            self._unavailable_nodes.pop(node)
-            self.endpoint_uris.append(node)
+        providers_to_clean = [provider for provider, retry_time in self._unavailable_providers.items() if current_time > retry_time]
+        for provider in providers_to_clean:
+            self._unavailable_providers.pop(provider)
+
+    def _mark_provider_as_unavailable(self, provider: URI) -> None:
+        """Mark a provider as unavailable and retry later."""
+        retry_after = 60
+        self._unavailable_providers[provider] = time.time() + retry_after
 
     @property
     def exception_retry_configuration(self) -> ExceptionRetryConfiguration:
@@ -159,20 +158,22 @@ class HTTPProvider(JSONBaseProvider):
         }
 
     def _make_request(self, method: RPCEndpoint, request_data: bytes) -> bytes:
-        nodes = self._get_refreshed_nodes()
-        logging.warning(nodes)
-        for node in nodes:
+        available_providers = self._get_prioritized_providers()
+        if not available_providers:
+            raise CannotHandleRequest("Endpoint uris are not provided.")
+
+        for provider in available_providers:
             try:
-                logging.info(f"Trying node: {node}")
                 response = self._request_session_manager.make_post_request(
-                    node, request_data, **self.get_request_kwargs()
+                    provider, request_data, **self.get_request_kwargs()
                 )
-                logging.warning(f"Successful connection to: {node}")
+                if provider in self._unavailable_providers:
+                    self._unavailable_providers.pop(provider)
                 return response
             except Exception as e:
-                logging.warning(f"Request to {node} failed: {e}")
-                self._mark_node_as_unavailable(node)
-        raise Exception("All nodes are currently unavailable.")
+                logging.warning(f"Request to {provider} failed: {e}")
+                self._mark_provider_as_unavailable(provider)
+        raise CannotHandleRequest("All providers are currently unavailable.")
 
     @handle_request_caching
     def make_request(self, method: RPCEndpoint, params: Any) -> RPCResponse:
@@ -186,18 +187,23 @@ class HTTPProvider(JSONBaseProvider):
     def make_batch_request(
         self, batch_requests: List[Tuple[RPCEndpoint, Any]]
     ) -> List[RPCResponse]:
-        nodes = self._get_refreshed_nodes()
-        for node in nodes:
-            self.logger.debug(f"Making batch request HTTP, uri: `{node}`")
+        available_providers = self._get_prioritized_providers()
+        if not available_providers:
+            raise CannotHandleRequest("Endpoint uris are not provided.")
+
+        for provider in available_providers:
+            self.logger.debug(f"Making batch request HTTP, uri: `{provider}`")
             request_data = self.encode_batch_rpc_request(batch_requests)
             try:
                 raw_response = self._request_session_manager.make_post_request(
-                    node, request_data, **self.get_request_kwargs()
+                    provider, request_data, **self.get_request_kwargs()
                 )
                 self.logger.debug("Received batch response HTTP.")
+                if provider in self._unavailable_providers:
+                    self._unavailable_providers.pop(provider)
                 responses_list = cast(List[RPCResponse], self.decode_rpc_response(raw_response))
                 return sort_batch_response_by_response_ids(responses_list)
             except Exception as e:
-                self._mark_node_as_unavailable(node)
-                self.logger.warning(f"Batch request to {node} failed: {e}")
-        raise Exception("All nodes are currently unavailable.")
+                self._mark_provider_as_unavailable(provider)
+                self.logger.warning(f"Batch request to {provider} failed: {e}")
+            raise CannotHandleRequest("All providers are currently unavailable.")

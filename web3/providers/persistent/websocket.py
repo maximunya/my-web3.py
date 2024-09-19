@@ -47,7 +47,7 @@ class WebSocketProvider(PersistentConnectionProvider):
         websocket_kwargs: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> None:
-        self._unavailable_nodes = {}
+        self._unavailable_providers = {}
 
         if endpoint_uris is None:
             self.endpoint_uris = [get_default_endpoint()]
@@ -80,27 +80,25 @@ class WebSocketProvider(PersistentConnectionProvider):
     def __str__(self) -> str:
         return f"WebSocket connection: {self.endpoint_uris}"
 
-    def _get_refreshed_nodes(self):
-        """Refresh the list of nodes, cleaning out unavailable ones."""
-        self._clean_unavailable_nodes()
-        if not self.endpoint_uris:
-            raise Exception("All nodes are currently unavailable.")
-        return self.endpoint_uris
+    def _get_prioritized_providers(self):
+        """Return the list of prioritized available providers, cleaning out expired unavailable ones."""
+        self._clean_unavailable_providers()
 
-    def _mark_node_as_unavailable(self, node: URI) -> None:
-        """Mark a node as unavailable and retry later."""
-        if node in self.endpoint_uris:
-            self.endpoint_uris.remove(node)
-        retry_after = 60  # Set retry time to 60 seconds
-        self._unavailable_nodes[node] = time.time() + retry_after
+        available_providers = [provider for provider in self.endpoint_uris if provider not in self._unavailable_providers]
+        unavailable_providers = [provider for provider in self.endpoint_uris if provider in self._unavailable_providers]
+        return available_providers + unavailable_providers
 
-    def _clean_unavailable_nodes(self) -> None:
-        """Clean up nodes that are past their retry period."""
+    def _clean_unavailable_providers(self) -> None:
+        """Clean up providers that are past their retry period."""
         current_time = time.time()
-        nodes_to_remove = [node for node, retry_time in self._unavailable_nodes.items() if current_time > retry_time]
-        for node in nodes_to_remove:
-            self._unavailable_nodes.pop(node)
-            self.endpoint_uris.append(node)
+        providers_to_clean = [provider for provider, retry_time in self._unavailable_providers.items() if current_time > retry_time]
+        for provider in providers_to_clean:
+            self._unavailable_providers.pop(provider)
+
+    def _mark_provider_as_unavailable(self, provider: URI) -> None:
+        """Mark a provider as unavailable and retry later."""
+        retry_after = 60
+        self._unavailable_providers[provider] = time.time() + retry_after
 
     async def is_connected(self, show_traceback: bool = False) -> bool:
         if not self._ws:
@@ -132,14 +130,17 @@ class WebSocketProvider(PersistentConnectionProvider):
         return json.loads(raw_response)
 
     async def _provider_specific_connect(self) -> None:
-        nodes = self._get_refreshed_nodes()
-        for node in nodes:
+        available_providers = self._get_prioritized_providers()
+        if not available_providers:
+            raise WebSocketException("Endpoint uris are not provided.")
+
+        for provider in available_providers:
             try:
-                self._ws = await connect(node, **self.websocket_kwargs)
+                self._ws = await connect(provider, **self.websocket_kwargs)
                 break
             except (WebSocketException, ConnectionClosedOK) as e:
-                self._mark_node_as_unavailable(node)
-                self.logger.error(f"Failed to connect to {node}: {e}")
+                self._mark_provider_as_unavailable(provider)
+                self.logger.error(f"Failed to connect to {provider}: {e}")
 
     async def _provider_specific_disconnect(self) -> None:
         if self._ws is not None and not self._ws.closed:

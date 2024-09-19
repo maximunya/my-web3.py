@@ -77,8 +77,8 @@ class PersistentConnectionProvider(AsyncJSONBaseProvider, ABC):
         self._max_connection_retries = max_connection_retries
 
     def get_endpoint_uri_or_ipc_path(self) -> str:
-        if hasattr(self, "endpoint_uri"):
-            return str(self.endpoint_uri)
+        if hasattr(self, "endpoint_uris"):
+            return str(self.endpoint_uris[0])
         elif hasattr(self, "ipc_path"):
             return str(self.ipc_path)
         else:
