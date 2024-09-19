@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import time
 from typing import (
     Any,
     Dict,
@@ -8,7 +9,7 @@ from typing import (
     Optional,
     Tuple,
     Union,
-    cast,
+    cast, Generator,
 )
 
 from aiohttp import (
@@ -51,16 +52,17 @@ from .utils import (
     ExceptionRetryConfiguration,
     check_if_retry_on_failure,
 )
+from ...exceptions import Web3ValidationError, CannotHandleRequest
 
 
 class AsyncHTTPProvider(AsyncJSONBaseProvider):
     logger = logging.getLogger("web3.providers.AsyncHTTPProvider")
-    endpoint_uri = None
+    endpoint_uris = None
     _request_kwargs = None
 
     def __init__(
         self,
-        endpoint_uri: Optional[Union[URI, str]] = None,
+        endpoint_uris: Optional[Union[URI, str, List[str], Tuple[str], Generator[str, None, None]]] = None,
         request_kwargs: Optional[Any] = None,
         exception_retry_configuration: Optional[
             Union[ExceptionRetryConfiguration, Empty]
@@ -68,13 +70,16 @@ class AsyncHTTPProvider(AsyncJSONBaseProvider):
         **kwargs: Any,
     ) -> None:
         self._request_session_manager = HTTPSessionManager()
+        self._unavailable_providers = {}
 
-        if endpoint_uri is None:
-            self.endpoint_uri = (
-                self._request_session_manager.get_default_http_endpoint()
-            )
+        if endpoint_uris is None:
+            self.endpoint_uris = [self._request_session_manager.get_default_http_endpoint()]
+        elif isinstance(endpoint_uris, str):
+            self.endpoint_uris = [URI(endpoint_uris), ]
+        elif isinstance(endpoint_uris, (list, tuple, Generator)):
+            self.endpoint_uris = [URI(uri) for uri in endpoint_uris]
         else:
-            self.endpoint_uri = URI(endpoint_uri)
+            raise Web3ValidationError("Invalid type for endpoint_uris")
 
         self._request_kwargs = request_kwargs or {}
         self._exception_retry_configuration = exception_retry_configuration
@@ -82,12 +87,32 @@ class AsyncHTTPProvider(AsyncJSONBaseProvider):
         super().__init__(**kwargs)
 
     async def cache_async_session(self, session: ClientSession) -> ClientSession:
-        return await self._request_session_manager.async_cache_and_return_session(
-            self.endpoint_uri, session
-        )
+        for uri in self.endpoint_uris:
+            await self._request_session_manager.async_cache_and_return_session(uri, session)
+        return session
 
     def __str__(self) -> str:
-        return f"RPC connection {self.endpoint_uri}"
+        return f"RPC connection {self.endpoint_uris}"
+
+    def _get_prioritized_providers(self):
+        """Return the list of prioritized available providers, cleaning out expired unavailable ones."""
+        self._clean_unavailable_providers()
+
+        available_providers = [provider for provider in self.endpoint_uris if provider not in self._unavailable_providers]
+        unavailable_providers = [provider for provider in self.endpoint_uris if provider in self._unavailable_providers]
+        return available_providers + unavailable_providers
+
+    def _clean_unavailable_providers(self) -> None:
+        """Clean up providers that are past their retry period."""
+        current_time = time.time()
+        providers_to_clean = [provider for provider, retry_time in self._unavailable_providers.items() if current_time > retry_time]
+        for provider in providers_to_clean:
+            self._unavailable_providers.pop(provider)
+
+    def _mark_provider_as_unavailable(self, provider: URI) -> None:
+        """Mark a provider as unavailable and retry later."""
+        retry_after = 60
+        self._unavailable_providers[provider] = time.time() + retry_after
 
     @property
     def exception_retry_configuration(self) -> ExceptionRetryConfiguration:
@@ -123,45 +148,33 @@ class AsyncHTTPProvider(AsyncJSONBaseProvider):
         }
 
     async def _make_request(self, method: RPCEndpoint, request_data: bytes) -> bytes:
-        """
-        If exception_retry_configuration is set, retry on failure; otherwise, make
-        the request without retrying.
-        """
-        if (
-            self.exception_retry_configuration is not None
-            and check_if_retry_on_failure(
-                method, self.exception_retry_configuration.method_allowlist
-            )
-        ):
-            for i in range(self.exception_retry_configuration.retries):
-                try:
-                    return await self._request_session_manager.async_make_post_request(
-                        self.endpoint_uri, request_data, **self.get_request_kwargs()
-                    )
-                except tuple(self.exception_retry_configuration.errors):
-                    if i < self.exception_retry_configuration.retries - 1:
-                        await asyncio.sleep(
-                            self.exception_retry_configuration.backoff_factor * 2**i
-                        )
-                        continue
-                    else:
-                        raise
-            return None
-        else:
-            return await self._request_session_manager.async_make_post_request(
-                self.endpoint_uri, request_data, **self.get_request_kwargs()
-            )
+        available_providers = self._get_prioritized_providers()
+        if not available_providers:
+            raise CannotHandleRequest("Endpoint uris are not provided.")
+
+        for provider in available_providers:
+            try:
+                response = await self._request_session_manager.async_make_post_request(
+                    provider, request_data, **self.get_request_kwargs()
+                )
+                if provider in self._unavailable_providers:
+                    self._unavailable_providers.pop(provider)
+                return response
+            except Exception as e:
+                logging.warning(f"Request to {provider} failed: {e}")
+                self._mark_provider_as_unavailable(provider)
+        raise CannotHandleRequest("All providers are currently unavailable.")
 
     @async_handle_request_caching
     async def make_request(self, method: RPCEndpoint, params: Any) -> RPCResponse:
         self.logger.debug(
-            f"Making request HTTP. URI: {self.endpoint_uri}, Method: {method}"
+            f"Making request HTTP. URI: {self.endpoint_uris}, Method: {method}"
         )
         request_data = self.encode_rpc_request(method, params)
         raw_response = await self._make_request(method, request_data)
         response = self.decode_rpc_response(raw_response)
         self.logger.debug(
-            f"Getting response HTTP. URI: {self.endpoint_uri}, "
+            f"Getting response HTTP. URI: {self.endpoint_uris}, "
             f"Method: {method}, Response: {response}"
         )
         return response
@@ -169,11 +182,24 @@ class AsyncHTTPProvider(AsyncJSONBaseProvider):
     async def make_batch_request(
         self, batch_requests: List[Tuple[RPCEndpoint, Any]]
     ) -> List[RPCResponse]:
-        self.logger.debug(f"Making batch request HTTP - uri: `{self.endpoint_uri}`")
-        request_data = self.encode_batch_rpc_request(batch_requests)
-        raw_response = await self._request_session_manager.async_make_post_request(
-            self.endpoint_uri, request_data, **self.get_request_kwargs()
-        )
-        self.logger.debug("Received batch response HTTP.")
-        responses_list = cast(List[RPCResponse], self.decode_rpc_response(raw_response))
-        return sort_batch_response_by_response_ids(responses_list)
+        available_providers = self._get_prioritized_providers()
+        if not available_providers:
+            raise CannotHandleRequest("Endpoint uris are not provided.")
+
+        for provider in available_providers:
+            self.logger.debug(f"Making batch request HTTP, uri: `{provider}`")
+            request_data = self.encode_batch_rpc_request(batch_requests)
+            try:
+                raw_response = await self._request_session_manager.async_make_post_request(
+                    provider, request_data, **self.get_request_kwargs()
+                )
+                self.logger.debug("Received batch response HTTP.")
+
+                if provider in self._unavailable_providers:
+                    self._unavailable_providers.pop(provider)
+                responses_list = cast(List[RPCResponse], self.decode_rpc_response(raw_response))
+                return sort_batch_response_by_response_ids(responses_list)
+            except Exception as e:
+                self._mark_provider_as_unavailable(provider)
+                self.logger.warning(f"Batch request to {provider} failed: {e}")
+            raise CannotHandleRequest("All providers are currently unavailable.")
